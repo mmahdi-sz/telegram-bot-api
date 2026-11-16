@@ -7,6 +7,7 @@
 #pragma once
 
 #include "telegram-bot-api/ClientParameters.h"
+#include "telegram-bot-api/UploadProgress.h"
 
 #include "td/net/HttpFile.h"
 
@@ -77,6 +78,17 @@ class Query final : public td::ListNode {
   const td::vector<td::HttpFile> &files() const {
     return files_;
   }
+
+  bool is_direct_loopback() const {
+    if (!peer_ip_address_.is_valid() || !get_header("x-real-ip").empty() || !get_header("x-forwarded-for").empty() ||
+        !get_header("forwarded").empty()) {
+      return false;
+    }
+    auto ip = peer_ip_address_.get_ip_str();
+    return ip == "127.0.0.1" || ip == "::1";
+  }
+
+  std::shared_ptr<UploadProgress> upload_progress;
 
   td::int64 files_size() const;
 

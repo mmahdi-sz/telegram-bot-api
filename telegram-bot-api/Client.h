@@ -58,6 +58,8 @@ class Client final : public WebhookActor::Callback {
   ServerBotInfo get_bot_info() const;
 
  private:
+  friend class UploadProgressClientTest;
+
   using int32 = td::int32;
   using int64 = td::int64;
 
@@ -526,6 +528,10 @@ class Client final : public WebhookActor::Callback {
   void update_shared_unix_time_difference();
 
   void on_update_file(object_ptr<td_api::file> file);
+  td::Status process_get_upload_progress_query(PromisedQueryPtr &query);
+  td::Status process_cancel_upload_query(PromisedQueryPtr &query);
+  class TdOnCancelUploadCallback;
+  UploadProgressRegistry upload_progress_;
 
   static bool to_bool(td::MutableSlice value);
 

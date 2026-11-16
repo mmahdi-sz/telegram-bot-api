@@ -5,6 +5,8 @@
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "telegram-bot-api/Client.h"
+#include "telegram-bot-api/JsonUploadProgress.h"
+#include "telegram-bot-api/UploadProgressFile.h"
 
 #include "telegram-bot-api/ClientParameters.h"
 
@@ -219,6 +221,8 @@ bool Client::is_special_error_code(int32 error_code) {
 }
 
 bool Client::init_methods() {
+  methods_.emplace("getuploadprogress", &Client::process_get_upload_progress_query);
+  methods_.emplace("cancelupload", &Client::process_cancel_upload_query);
   methods_.emplace("getme", &Client::process_get_me_query);
   methods_.emplace("getmycommands", &Client::process_get_my_commands_query);
   methods_.emplace("setmycommands", &Client::process_set_my_commands_query);
@@ -9837,6 +9841,8 @@ td_api::object_ptr<td_api::Object> Client::execute(object_ptr<td_api::Function> 
 }
 
 void Client::on_update_file(object_ptr<td_api::file> file) {
+  upload_progress_.update(file->id_, file->size_, file->remote_->uploaded_size_,
+                          file->remote_->is_uploading_completed_);
   auto file_id = file->id_;
   if (!is_file_being_downloaded(file_id)) {
     return;
@@ -14172,6 +14178,14 @@ td::int64 Client::extract_yet_unsent_message_query_id(int64 chat_id, int64 messa
 }
 
 void Client::on_message_send_succeeded(object_ptr<td_api::message> &&message, int64 old_message_id) {
+  auto pending = yet_unsent_messages_.find({message->chat_id_, old_message_id});
+  if (pending != yet_unsent_messages_.end()) {
+    auto &progress = pending_send_message_queries_[pending->second.send_message_query_id]->query->upload_progress;
+    const auto *file = get_upload_file(message->content_.get());
+    if (progress && file != nullptr) {
+      progress->attach(file->id_, file->size_, file->remote_->uploaded_size_, file->remote_->is_uploading_completed_);
+    }
+  }
   const auto *message_info = add_message(std::move(message), true);
   int64 chat_id = message_info->chat_id;
   int64 new_message_id = message_info->id;
@@ -14324,10 +14338,101 @@ void Client::on_cmd(PromisedQueryPtr query, bool force) {
     }
   }
 
+  if (query->has_arg("upload_id") && query->method() != "getuploadprogress" && query->method() != "cancelupload") {
+    if (!parameters_->local_mode_ || !query->is_direct_loopback()) {
+      return fail_query(403, "Forbidden: upload progress requires direct loopback access in local mode",
+                        std::move(query));
+    }
+    auto method = query->method();
+    if ((method != "sendvideo" && method != "senddocument" && method != "sendaudio" && method != "sendvoice" &&
+         method != "sendphoto" && method != "sendanimation" && method != "sendvideonote") ||
+        !query->arg("business_connection_id").empty()) {
+      return fail_query(400, "Bad Request: upload_id supports only ordinary single-media sends", std::move(query));
+    }
+    auto id = query->arg("upload_id").str();
+    if (!UploadProgressRegistry::valid_id(id)) {
+      return fail_query(400, "Bad Request: upload_id must contain 1-64 ASCII letters, digits, underscores or hyphens",
+                        std::move(query));
+    }
+    auto now = td::Time::now();
+    if (upload_progress_.find(id, now)) {
+      return fail_query(409, "Conflict: upload_id already exists", std::move(query));
+    }
+    query->upload_progress = upload_progress_.create(id, now);
+    if (!query->upload_progress) {
+      return fail_query(429, "Too Many Requests: upload progress registry is full", std::move(query));
+    }
+  }
+
   auto result = (this->*(method_it->second))(query);
   if (result.is_error()) {
     fail_query_with_error(std::move(query), result.code(), result.message());
   }
+}
+
+class Client::TdOnCancelUploadCallback final : public TdQueryCallback {
+ public:
+  TdOnCancelUploadCallback(std::shared_ptr<UploadProgress> progress, PromisedQueryPtr query)
+      : progress_(std::move(progress)), query_(std::move(query)) {
+  }
+  void on_result(object_ptr<td_api::Object> result) final {
+    if (result->get_id() == td_api::error::ID) {
+      progress_->cancelling = false;
+      return fail_query_with_error(std::move(query_), move_object_as<td_api::error>(result));
+    }
+    CHECK(result->get_id() == td_api::ok::ID);
+    answer_query(td::JsonTrue(), std::move(query_));
+  }
+
+ private:
+  std::shared_ptr<UploadProgress> progress_;
+  PromisedQueryPtr query_;
+};
+
+td::Status Client::process_get_upload_progress_query(PromisedQueryPtr &query) {
+  if (!parameters_->local_mode_ || !query->is_direct_loopback()) {
+    return td::Status::Error(403, "Upload progress requires direct loopback access in local mode");
+  }
+  auto id = query->arg("upload_id").str();
+  if (!UploadProgressRegistry::valid_id(id)) {
+    return td::Status::Error(400, "Invalid upload_id");
+  }
+  auto now = td::Time::now();
+  auto progress = upload_progress_.find(id, now);
+  if (!progress) {
+    fail_query(404, "Not Found: upload not registered or expired", std::move(query));
+    return td::Status::OK();
+  }
+  answer_query(JsonUploadProgress(id, *progress, now), std::move(query));
+  return td::Status::OK();
+}
+
+td::Status Client::process_cancel_upload_query(PromisedQueryPtr &query) {
+  if (!parameters_->local_mode_ || !query->is_direct_loopback()) {
+    return td::Status::Error(403, "Upload cancellation requires direct loopback access in local mode");
+  }
+  auto id = query->arg("upload_id").str();
+  if (!UploadProgressRegistry::valid_id(id)) {
+    return td::Status::Error(400, "Invalid upload_id");
+  }
+  auto progress = upload_progress_.find(id, td::Time::now());
+  if (!progress) {
+    fail_query(404, "Not Found: upload not registered or expired", std::move(query));
+    return td::Status::OK();
+  }
+  if (progress->state == UploadProgress::State::Cancelled || progress->cancelling) {
+    answer_query(td::JsonTrue(), std::move(query));
+    return td::Status::OK();
+  }
+  if (progress->terminal() || progress->message_id == 0 ||
+      !yet_unsent_messages_.count({progress->chat_id, progress->message_id})) {
+    fail_query(409, "Conflict: upload has no cancellable pending message", std::move(query));
+    return td::Status::OK();
+  }
+  progress->cancelling = true;
+  send_request(make_object<td_api::deleteMessages>(progress->chat_id, td::vector<int64>{progress->message_id}, true),
+               td::make_unique<TdOnCancelUploadCallback>(progress, std::move(query)));
+  return td::Status::OK();
 }
 
 td::Status Client::process_get_me_query(PromisedQueryPtr &query) {
@@ -18108,6 +18213,15 @@ void Client::on_sent_message(object_ptr<td_api::message> &&message, int64 query_
   CHECK(emplace_result.second);
 
   auto &query = *pending_send_message_queries_[query_id];
+  if (query.query->upload_progress) {
+    auto &progress = *query.query->upload_progress;
+    progress.chat_id = chat_id;
+    progress.message_id = message_id;
+    const auto *file = get_upload_file(message->content_.get());
+    if (file != nullptr) {
+      progress.attach(file->id_, file->size_, file->remote_->uploaded_size_, file->remote_->is_uploading_completed_);
+    }
+  }
   query.awaited_message_count++;
   query.total_message_count++;
 }
@@ -20267,6 +20381,14 @@ td::unique_ptr<Client::MessageInfo> Client::delete_message(int64 chat_id, int64 
   auto message_info = std::move(messages_[{chat_id, message_id}]);
   if (message_info == nullptr) {
     if (yet_unsent_messages_.count({chat_id, message_id}) > 0) {
+      auto pending_id = yet_unsent_messages_.find({chat_id, message_id})->second.send_message_query_id;
+      auto &progress = pending_send_message_queries_[pending_id]->query->upload_progress;
+      if (progress && progress->cancelling && !only_from_cache) {
+        progress->finish(UploadProgress::State::Cancelled, 0, td::Time::now());
+        on_message_send_failed(chat_id, message_id, 0, make_object<td_api::error>(400, "Upload cancelled"));
+        return message_info;
+      }
+
       // yet unsent message is deleted, possible only if we are trying to write to inaccessible supergroup or
       // sent message was deleted before added to the chat
       auto chat_info = get_chat(chat_id);

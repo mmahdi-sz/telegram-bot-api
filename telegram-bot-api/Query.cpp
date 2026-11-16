@@ -103,6 +103,9 @@ void Query::set_ok(td::BufferSlice result) {
   LOG(INFO) << "Query " << this << ": " << td::tag("method", method_) << td::tag("text", result.as_slice());
   answer_ = std::move(result);
   state_ = State::OK;
+  if (upload_progress) {
+    upload_progress->finish(UploadProgress::State::Completed, 0, td::Time::now());
+  }
   http_status_code_ = 200;
   send_response_stat();
 }
@@ -113,6 +116,9 @@ void Query::set_error(int http_status_code, td::BufferSlice result) {
   CHECK(state_ == State::Query);
   answer_ = std::move(result);
   state_ = State::Error;
+  if (upload_progress) {
+    upload_progress->finish(UploadProgress::State::Failed, http_status_code, td::Time::now());
+  }
   http_status_code_ = http_status_code;
   send_response_stat();
 }
