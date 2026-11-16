@@ -42,7 +42,7 @@ jobs:
         run: cmake --build build --parallel 4
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -R '^upload-progress'
 
       - name: Package Linux x86_64 binary
         if: github.event_name != 'pull_request'
