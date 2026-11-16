@@ -8,7 +8,7 @@ All extension requests require `--local`, direct loopback access (`127.0.0.1` or
 
 Supply an optional `upload_id` on `sendVideo`, `sendDocument`, `sendAudio`, `sendVoice`, `sendPhoto`, `sendAnimation`, or `sendVideoNote`. IDs contain 1–64 ASCII letters, digits, `_` or `-`; generate a fresh random ID for each request. Existing requests without this field keep their behavior. Albums, business messages, edits, and stories are not supported by this extension.
 
-Poll `POST /bot<TOKEN>/getUploadProgress` with `upload_id` in the JSON body, at about 2-second intervals. Example result:
+Poll `POST /bot<TOKEN>/getUploadProgress` with `upload_id` in the JSON body, at about 1-second intervals. Example result:
 
 ```json
 {"ok":true,"result":{"upload_id":"job_123","stage":"uploading","uploaded_bytes":1048576,"total_bytes":10485760,"size_known":true,"remote_complete":false,"elapsed_seconds":2.5,"error_code":0}}
